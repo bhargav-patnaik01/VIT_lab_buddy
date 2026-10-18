@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lab Calibration & Access Tracker (VIT) - API Gateway + Lambda (FastAPI), RDS PostgreSQL, S3 certificates,
+  scheduled due-date scan (EventBridge -> Lambda -> SNS), React frontend on S3 + CloudFront.
+
+# NOT yet deployed or validated against a real account - run `sam validate --lint` first.
+# Build the Lambda bundle with scripts/build-lambda.ps1, then `sam build --use-container` (needs Docker, because
+# pydantic-core ships compiled wheels that must be Linux builds) and `sam deploy --guided`.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for RDS and the Lambda functions.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two private subnets in different AZs. They need a route to the internet via NAT, or VPC endpoints for
+      Secrets Manager and SNS (interface) and S3 (gateway), because the Lambdas call those services.
+  AlertEmail:
+    Type: String
+    Description: Receives the daily overdue-calibration digest (confirm the SNS subscription email) and becomes the first admin login.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbMultiAz:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  DeviceApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 24
+    Description: Shared secret the RFID readers / instrument controllers send in X-Device-Key.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    MemorySize: 512
+    Timeout: 29
+    Environment:
+      Variables:
+        CAD_ENV: aws
+        CAD_TIMEZONE: Asia/Kolkata
+        STORAGE_BACKEND: s3
+        S3_BUCKET: !Ref CertificateBucket
+        SNS_TOPIC_ARN: !Ref AlertTopic
+        DB_SECRET_ARN: !Ref DbSecret
+        DB_HOST: !GetAtt Database.Endpoint.Address
+        DB_NAME: cad
+        JWT_SECRET_ARN: !Ref JwtSecret
+        BOOTSTRAP_ADMIN_SECRET_ARN: !Ref BootstrapAdminSecret
+        DEVICE_API_KEY: !Ref DeviceApiKey
+        FRONTEND_DIST: /nonexistent
+    VpcConfig:
+      SecurityGroupIds: [!Ref LambdaSecurityGroup]
+      SubnetIds: !Ref PrivateSubnetIds
+
+Resources:
+  # ---------------------------------------------------------------- secrets
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: RDS master credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "cad_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Signs session tokens
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 64
+        ExcludePunctuation: true
+  BootstrapAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: First administrator login (read it once, sign in, then change the password)
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"email": "${AlertEmail}"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------- network + database
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CAD Lambda functions
+      VpcId: !Ref VpcId
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CAD PostgreSQL - only the Lambda functions may connect
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: CAD database subnets
+      SubnetIds: !Ref PrivateSubnetIds
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: '17.6'   # confirm availability: aws rds describe-db-engine-versions --engine postgres
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: cad
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      MultiAZ: !Ref DbMultiAz
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+
+  # ---------------------------------------------------------------- S3
+  CertificateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      VersioningConfiguration: {Status: Enabled}   # certificates are audit evidence: keep every version
+  CertificateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CertificateBucket
+      PolicyDocument:
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt CertificateBucket.Arn, !Sub '${CertificateBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: CloudFrontRead
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals: {'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'}
+
+  # ---------------------------------------------------------------- notifications
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------- compute
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: build/lambda/
+      Handler: lambda_handler.api_handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject]
+              Resource: !Sub '${CertificateBucket.Arn}/*'
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: [!Ref DbSecret, !Ref JwtSecret, !Ref BootstrapAdminSecret]
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /api/{proxy+}
+            Method: ANY
+            ApiId: !Ref HttpApi
+  ScanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: build/lambda/
+      Handler: lambda_handler.scan_handler
+      Timeout: 120
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: [!Ref DbSecret, !Ref JwtSecret, !Ref BootstrapAdminSecret]
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AlertTopic
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 2 * * ? *)   # 08:00 IST every day
+            Description: Daily calibration due-date scan
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+
+  # ---------------------------------------------------------------- CloudFront (S3 site + /api/* -> API Gateway, same origin)
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SpaRewrite:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-spa-rewrite'
+      AutoPublish: true
+      FunctionConfig: {Comment: Serve index.html for client-side routes, Runtime: cloudfront-js-2.0}
+      FunctionCode: |
+        function handler(event) {
+          var r = event.request;
+          if (!r.uri.includes('.') ) { r.uri = '/index.html'; }
+          return r;
+        }
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: site
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {OriginAccessIdentity: ''}
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+          - Id: api
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig: {OriginProtocolPolicy: https-only}
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewrite.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader (forwards Authorization)
+
+Outputs:
+  SiteUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref Distribution
+  CertificateBucketName:
+    Value: !Ref CertificateBucket
+  BootstrapAdminSecretArn:
+    Description: Read this secret once for the first admin password
+    Value: !Ref BootstrapAdminSecret
+  DeviceIngestUrl:
+    Value: !Sub 'https://${Distribution.DomainName}/api/ingest'
